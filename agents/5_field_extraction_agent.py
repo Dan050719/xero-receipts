@@ -1,125 +1,202 @@
-import imaplib
-import email
-from email.header import decode_header
 import os
-import pdfkit
+import json
+from pathlib import Path
 from dotenv import load_dotenv
-from datetime import datetime
+from openai import OpenAI
 
 # Load environment variables from .env file
 load_dotenv()
 
-EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
-APP_PASSWORD = os.getenv("APP_PASSWORD")
+# Set the project root directory
+project_root = Path(__file__).resolve().parent.parent
 
-# Define the project root and output directories
-project_root = os.path.dirname(os.path.abspath(__file__))  # Adjust if needed
-attachments_folder = os.path.join(project_root, "input/emails/emails_attachments")
-pdf_folder = os.path.join(project_root, "input/emails/emails_pdfs")
-text_folder = os.path.join(project_root, "input/emails/emails_txt")
+# Paths for directories and files
+cleaned_text_dir = project_root / "output/cleaned_text/"
+structured_data_dir = project_root / "output/structured_data/"
+structured_data_code_dir = project_root / "output/structured_data_code/"
+log_file = project_root / "logs/field_extraction_log.txt"
 
-# Create directories if they do not exist
-os.makedirs(attachments_folder, exist_ok=True)
-os.makedirs(pdf_folder, exist_ok=True)
-os.makedirs(text_folder, exist_ok=True)
+# OpenAI API key
+client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 
-print(f"Attachments folder exists: {os.path.exists(attachments_folder)}")
-print(f"PDF folder exists: {os.path.exists(pdf_folder)}")
-print(f"Text folder exists: {os.path.exists(text_folder)}")
+def read_cleaned_json_files(directory: Path) -> dict:
+    """
+    Read all cleaned JSON files from a specified directory.
+    """
+    json_files = list(directory.glob("*.json"))
+    json_data = {}
+    for json_file in json_files:
+        with json_file.open("r") as f:
+            json_data[json_file.stem] = json.load(f)
+    return json_data
 
-# Configure pdfkit
-path_wkhtmltopdf = '/usr/local/bin/wkhtmltopdf'  # Adjust this path if necessary
-config = pdfkit.configuration(wkhtmltopdf=path_wkhtmltopdf)
+def is_valid_person_name(name: str) -> bool:
+    """
+    Determine if the given name is likely a person's name.
+    """
+    # Define some simple rules to identify a person's name
+    # This can be enhanced with more sophisticated checks if needed
+    if any(word in name.lower() for word in ["inc", "corp", "llc", "ltd", "gmbh", "co", "company"]):
+        return False
+    if len(name.split()) > 1:
+        return True
+    return False
 
-# Connect to your email server
-imap = imaplib.IMAP4_SSL("imap.gmail.com")
+def extract_fields_with_openai(client: OpenAI, text: str) -> dict:
+    """
+    Use the OpenAI API to extract specific fields from the provided text.
+    """
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant that can extract structured information from unstructured text."},
+        {"role": "user", "content": f"""
+        Extract the following information from the receipt text. The ContactName field must be populated with the company name if no valid person's name is identified. If the company name cannot be identified, use "unidentified":
+        - ContactName
+        - EmailAddress (if available)
+        - POAddressLine1 (if available)
+        - POAddressLine2 (if available)
+        - POAddressLine3 (if available)
+        - POAddressLine4 (if available)
+        - POCity (if available)
+        - PORegion (if available)
+        - POPostalCode (if available)
+        - POCountry (if available)
+        - InvoiceNumber
+        - InvoiceDate
+        - DueDate (if available)
+        - InventoryItemCode (if available)
+        - Description
+        - Quantity (if available, otherwise default to 1)
+        - UnitAmount
+        - AccountCode (if available)
+        - TaxType
+        - TrackingName1 (if available)
+        - TrackingOption1 (if available)
+        - TrackingName2 (if available)
+        - TrackingOption2 (if available)
+        - Currency
 
-# Use your app password here
-imap.login(EMAIL_ADDRESS, APP_PASSWORD)
+        Receipt text:
+        {text}
+        """}
+    ]
 
-imap.select("inbox")
+    response = client.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=messages,
+        max_tokens=1500,
+        temperature=0.5
+    )
 
-# Search for all emails
-status, messages = imap.search(None, "ALL")
-email_ids = messages[0].split()
+    # Log the response for debugging
+    print(f"API response: {response}")
 
-for email_id in email_ids:
-    # Fetch the email by ID
-    res, msg = imap.fetch(email_id, "(RFC822)")
+    # Access the content from the response object correctly
+    content = response.choices[0].message.content.strip()
 
-    for response in msg:
-        if isinstance(response, tuple):
-            # Parse the email
-            msg = email.message_from_bytes(response[1])
-            # Decode the email subject
-            subject, encoding = decode_header(msg["Subject"])[0]
-            if isinstance(subject, bytes):
-                subject = subject.decode(encoding if encoding else "utf-8")
-            
-            # Create a valid filename with a unique identifier
-            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-            filename = f"{timestamp}_{''.join([c if c.isalnum() else '_' for c in subject])}"
+    # Log the content for debugging
+    print(f"Extracted content: {content}")
 
-            # Save the email content to a text file
-            email_text_file = os.path.join(text_folder, f"{filename}.txt")
-            email_pdf_file = os.path.join(pdf_folder, f"{filename}.pdf")
+    # Manually parse the content and clean up keys
+    extracted_data = {}
+    company_identified = False
+    for line in content.split('\n'):
+        if ': ' in line:
+            key, value = line.split(': ', 1)
+            clean_key = key.strip().lstrip('-').strip()
+            clean_value = value.strip()
 
-            print(f"Processing email: {filename}")
+            # Handle ContactName specifically
+            if clean_key == "ContactName" and clean_value.lower() in ["not available", "not provided"]:
+                continue
+            elif clean_key == "ContactName" and is_valid_person_name(clean_value):
+                extracted_data["ContactName"] = clean_value
+                company_identified = True
+            elif clean_key == "Description" and not company_identified:
+                extracted_data["ContactName"] = clean_value
+                company_identified = True
 
-            body = None
+            extracted_data[clean_key] = clean_value
 
-            if msg.is_multipart():
-                for part in msg.walk():
-                    content_type = part.get_content_type()
-                    content_disposition = str(part.get("Content-Disposition"))
+    # Ensure ContactName is present
+    if "ContactName" not in extracted_data:
+        extracted_data["ContactName"] = "unidentified"
 
-                    if "attachment" in content_disposition:
-                        # Download attachment
-                        attachment_filename = part.get_filename()
-                        if attachment_filename:
-                            attachment_path = os.path.join(attachments_folder, f"{timestamp}_{attachment_filename}")
-                            try:
-                                with open(attachment_path, "wb") as f:
-                                    f.write(part.get_payload(decode=True))
-                                print(f"Saved attachment: {attachment_path}")
-                            except IOError as e:
-                                print(f"Error saving attachment {attachment_path}: {e}")
-                    elif content_type == "text/plain":
-                        try:
-                            body = part.get_payload(decode=True).decode('utf-8')
-                        except UnicodeDecodeError:
-                            try:
-                                body = part.get_payload(decode=True).decode('latin1')
-                            except UnicodeDecodeError:
-                                print(f"Failed to decode part of email: {filename}")
-                                continue
-            else:
-                try:
-                    body = msg.get_payload(decode=True).decode('utf-8')
-                except UnicodeDecodeError:
-                    try:
-                        body = msg.get_payload(decode=True).decode('latin1')
-                    except UnicodeDecodeError:
-                        print(f"Failed to decode email: {filename}")
-                        continue
+    # Default Quantity to 1 if not identified
+    if "Quantity" not in extracted_data or extracted_data["Quantity"].lower() in ["not available", "not provided"]:
+        extracted_data["Quantity"] = "1"
 
-            if body:
-                try:
-                    with open(email_text_file, "w") as f:
-                        f.write(body)
-                    print(f"Saved email text: {email_text_file}")
-                except IOError as e:
-                    print(f"Error saving text file {email_text_file}: {e}")
+    # Set currency to AUD
+    extracted_data["Currency"] = "AUD"
 
-                # Convert the text file to PDF
-                try:
-                    pdfkit.from_file(email_text_file, email_pdf_file, configuration=config)
-                    print(f"Converted to PDF: {email_pdf_file}")
-                except Exception as e:
-                    print(f"Failed to convert {email_text_file} to PDF: {e}")
+    # Set unidentified fields to "unidentified"
+    for field in ["EmailAddress", "POAddressLine1", "POAddressLine2", "POAddressLine3", "POAddressLine4",
+                  "POCity", "PORegion", "POPostalCode", "POCountry", "DueDate", "InventoryItemCode",
+                  "AccountCode", "TrackingName1", "TrackingOption1", "TrackingName2", "TrackingOption2"]:
+        if field not in extracted_data:
+            extracted_data[field] = "unidentified"
 
-                print(f"Text file exists: {os.path.exists(email_text_file)}")
-                print(f"PDF file exists: {os.path.exists(email_pdf_file)}")
+    return extracted_data
 
-# Logout and close the connection
-imap.logout()
+def save_structured_data(filename: str, structured_data: dict) -> None:
+    """
+    Save the extracted fields to a JSON file in the structured_data directory.
+    """
+    output_path = structured_data_dir / f"{filename}.json"
+    with output_path.open("w") as f:
+        json.dump(structured_data, f, indent=2)
+    print(f"Structured data saved to {output_path}")
+
+def log_processing_status(files: list) -> None:
+    """
+    Log the processing status of the files.
+    """
+    with log_file.open("a") as f:
+        for file in files:
+            f.write(f"Processed: {file}\n")
+
+def update_account_code(structured_data: dict, company: str, xero_info: list) -> dict:
+    """
+    Update the AccountCode based on the company name and Xero information.
+    """
+    account_code = "unidentified"
+    for item in xero_info:
+        if company.lower() in item['Name'].lower():
+            account_code = item['Code']
+            break
+    structured_data["AccountCode"] = account_code
+    return structured_data
+
+def read_xero_info(file_path: Path) -> list:
+    """
+    Read the Xero information from the JSON file.
+    """
+    with file_path.open("r") as f:
+        return json.load(f)
+
+if __name__ == "__main__":
+    # Ensure the output directory exists
+    structured_data_dir.mkdir(parents=True, exist_ok=True)
+    structured_data_code_dir.mkdir(parents=True, exist_ok=True)
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # Read cleaned JSON files from the cleaned_text directory
+    cleaned_data = read_cleaned_json_files(cleaned_text_dir)
+
+    # Read Xero info from the config file
+    xero_info_file = project_root / "config/xero_info.json"
+    xero_info = read_xero_info(xero_info_file)
+
+    # Extract fields using the OpenAI API and update account codes
+    structured_data = {}
+    for filename, data in cleaned_data.items():
+        full_text = " ".join([page["text"] for page in data])
+        extracted_fields = extract_fields_with_openai(client, full_text)
+        updated_fields = update_account_code(extracted_fields, extracted_fields["ContactName"], xero_info)
+        structured_data[filename] = updated_fields
+
+    # Save the structured data to the structured_data directory
+    for filename, data in structured_data.items():
+        save_structured_data(filename, data)
+
+    # Log the processing status
+    log_processing_status(list(structured_data.keys()))
