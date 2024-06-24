@@ -2,11 +2,14 @@ import json
 import os
 from pathlib import Path
 
+# Set the project root directory
+project_root = Path(__file__).resolve().parent.parent
+
 # Paths for directories and files
-user_info_file = Path("config/user_info.json")
-extracted_text_dir = Path("output/extracted_text/")
-cleaned_text_dir = Path("output/cleaned_text/")
-log_file = Path("logs/cleanup_log.txt")
+user_info_file = project_root / "config/user_info.json"
+extracted_text_dir = project_root / "output/extracted_text/"
+cleaned_text_dir =project_root / "output/cleaned_text/"
+log_file = project_root / "logs/cleanup_log.txt"
 
 def load_user_info():
     """

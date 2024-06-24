@@ -4,9 +4,12 @@ import json
 import os
 from pathlib import Path
 
+# Set the project root directory
+project_root = Path(__file__).resolve().parent.parent
+
 # Paths for directories and files
-uploaded_files_log = Path("logs/uploaded_files.txt")
-extracted_text_dir = Path("output/extracted_text/")
+uploaded_files_log = project_root / "logs/uploaded_files.txt"
+extracted_text_dir = project_root / "output/extracted_text/"
 
 def read_uploaded_files():
     """

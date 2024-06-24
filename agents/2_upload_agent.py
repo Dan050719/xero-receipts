@@ -2,10 +2,13 @@ import os
 import time
 from pathlib import Path
 
+# Set the project root directory
+project_root = Path(__file__).resolve().parent.parent
+
 # Directory to monitor for new PDF uploads
-input_dir = Path("input/pdfs/")
+input_dir = project_root / "input/pdfs"
 # Log file to record paths of new PDF files
-log_file = Path("logs/uploaded_files.txt")
+log_file = project_root / "logs/uploaded_files.txt"
 
 def log_new_files(new_files):
     """
